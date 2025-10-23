@@ -1,0 +1,293 @@
+---
+title: "Trip Identification Algorithm"
+format: gfm
+---
+
+### Auxiliar methods
+
+```{.python}
+import pandas as pd
+import numpy as np
+import logging
+from datetime import datetime
+
+SHORTENINGS_DB = dict() # { voyage_id: { starts(Optional): stop_id, ends(Optional): stop_id } }
+
+"""
+A method to aggregate service events into a single trip information row
+
+...
+
+Attributes
+----------
+df_service: pandas.DataFrame 
+  A table with all the events registered for the service_id
+feed_service_ids: dict
+  Dictionary with list of service_id per date (output of ptg.read_service_ids_by_date())
+feed_stops_services: pandas.DataFrame
+  A table with all the stops and their associated service_id (columns stop_id, stop_name, stop_code and service_id)
+trips_with_day: pandas.DataFrame
+  A table with all the trips and their associated date (columns trip_id, route_short_name, direction_id, departure_stop, arrival_stop, departure_time, arrival_time, duration, date)
+
+Returns
+----------
+trip_info: pandas.DataFrame
+"""
+@staticmethod
+def process_service(df_service, feed_service_ids, feed_stops_services, trips_with_day):
+  # 1. Get base information for service
+  service_id = df_service["service_id"].iloc[0]
+  # Prev:  direction_id = 1 if df_service["Direction"].iloc[0] == "DESC" else 0 if df_service["Direction"].iloc[0] else None
+  # extractors.py: if data["Direction"] == "CIRC": return 2 elif data["Direction"] == "ASC": return 0 elif data["Direction"] == "DESC": return 1  return 9
+  # DESC/CIRC: 0; ASC: 1; Others: None
+  direction_id = None if df_service["direction"].iloc[0] == 9 else 0 if df_service["direction"].iloc[0] == 2 else df_service["direction"].iloc[0]
+  voyage_number = df_service["VoyageNumber"].iloc[0]
+  route_number = df_service["RouteNumber"].iloc[0]
+  driver_mec = df_service["DriverMec"].iloc[0]
+  bus_number = df_service["BusNumber"].iloc[0]
+
+  trip_info = pd.Series({
+    "service_id": service_id,
+    "voyage_id": None, 
+    "RouteNumber": route_number,
+    "VoyageNumber": voyage_number,
+    "direction": df_service["direction"].iloc[0],
+    "DriverMec": driver_mec,
+    "BusNumber": bus_number,
+    "plate": df_service["plate"].iloc[0],
+    "date": None,
+    
+    "start_event": (df_service["category"] == 6).any(),
+    "start_stop": None,
+    "start_stop_id": None,
+    "start_timestamp": None,
+    "end_event": (df_service["category"] == 7).any(),
+    "end_stop": None,
+    "end_timestamp": None,
+    "end_stop_id": None,
+    
+    "duration": None, # Minutes
+    "n_stops": len(df_service[df_service["category"] == 11]),
+    "n_updates": len(df_service[df_service["category"] == 9]),
+    
+    "trip_id": None,
+    "trip_id_start_diff": None, # Minutes
+    "trip_id_duration_diff": None, # Minutes
+    
+    "driver_change": (df_service["category"] == 8).any(),
+    
+    "trip_shortened": False,
+    "trip_shortened_start": None,
+    "trip_shortened_end": None
+  })
+  logging.info(f"Running for service {trip_info['service_id']}...")
+
+  # 2. Special events 
+  if len(df_service[df_service["category"] == 11]) > 2: # At least two messages for start/end stops
+    # > Start of trip
+    start_stop = df_service[df_service["category"] == 11].iloc[0]
+    trip_info["start_stop"] = start_stop["stop_ref"]
+    trip_info["start_timestamp"] = start_stop["timestamp"]
+    # > End of trip
+    end_stop = df_service[df_service["category"] == 11].iloc[-1]
+    trip_info["end_stop"] = end_stop["stop_ref"]
+    trip_info["end_timestamp"] = end_stop["timestamp"]
+  # > Duration
+  date = datetime.fromtimestamp(df_service["timestamp"].iloc[0] / 1000).date()
+  if trip_info["start_timestamp"] and trip_info["end_timestamp"]:
+    t0 = datetime.fromtimestamp(trip_info["start_timestamp"] / 1000)
+    t1 = datetime.fromtimestamp(trip_info["end_timestamp"] / 1000)
+    trip_info["duration"] = int((t1 - t0).total_seconds() / 60)
+
+    date = datetime.fromtimestamp(trip_info["start_timestamp"] / 1000).date()
+  
+  service_ids = feed_service_ids[date]
+  if not service_ids or not len(service_ids): # Throw error
+    raise ValueError(f"No service_ids found for date {date} in GTFS feed.")
+  voyage_id = f"{date}_{route_number}_{bus_number}_{voyage_number}"
+  trip_info["voyage_id"] = voyage_id
+  trip_info["date"] = date
+  
+  # > Shortening
+  if (df_service["category"] == 32).any():
+    shortening = df_service[df_service["category"] == 32].iloc[0]
+    # >> Get trip end/start information (might have only one of them)
+    short_trip_end_voyage_id = f"{date}_{route_number}_{bus_number}_" + str(int(shortening["short_trip_end_id"])) if not np.isnan(shortening["short_trip_end_id"]) else None
+    short_trip_end_stop = int(shortening["short_trip_end_stop"]) if not np.isnan(shortening["short_trip_end_stop"]) else None
+    short_trip_start_voyage_id = f"{date}_{route_number}_{bus_number}_" + str(int(shortening["short_trip_start_id"])) if not np.isnan(shortening["short_trip_start_id"]) else None
+    short_trip_start_stop = int(shortening["short_trip_start_stop"]) if not np.isnan(shortening["short_trip_start_stop"]) else None
+    # >> Associate stop to GTFS
+    short_trip_end_stop_id = feed_stops_services[
+        feed_stops_services["service_id"].isin(service_ids)
+        & feed_stops_services["stop_id"].str.contains(f"_{short_trip_end_stop}")  
+    ]
+    if short_trip_end_stop_id.empty: # GTFS 01_03 has distinct stop_ids
+      short_trip_end_stop_id = feed_stops_services[feed_stops_services["stop_id"].str.contains(f"_{short_trip_end_stop}")  ]  
+    short_trip_start_stop_id = feed_stops_services[
+        feed_stops_services["service_id"].isin(service_ids)
+        & feed_stops_services["stop_id"].str.contains(f"_{short_trip_start_stop}")
+    ]
+    if short_trip_start_stop_id.empty: # GTFS 01_03 has distinct stop_ids
+      short_trip_start_stop_id = feed_stops_services[feed_stops_services["stop_id"].str.contains(f"_{short_trip_start_stop}")  ]
+    # >> Save shortening on db for future trips and apply to self
+    if not short_trip_end_stop_id.empty:
+      trip_shortening = SHORTENINGS_DB.get(short_trip_end_voyage_id, {})
+      trip_shortening["ends"] = short_trip_end_stop_id["stop_id"].iloc[0]
+      SHORTENINGS_DB[short_trip_end_voyage_id] = trip_shortening
+      if voyage_id == short_trip_end_voyage_id: # Update trip_info if shortening applies to self
+        trip_info["trip_shortened_end"] = short_trip_end_stop_id["stop_id"].iloc[0]
+        trip_info["trip_shortened"] = True
+    elif short_trip_end_stop: # Throw error
+      trip_info["trip_shortened"] = True
+      logging.error(f"Short trip end stop {short_trip_end_stop} for service {service_id} not found in GTFS feed.")
+    if not short_trip_start_stop_id.empty:
+      trip_shortening = SHORTENINGS_DB.get(short_trip_start_voyage_id, {})
+      trip_shortening["starts"] = short_trip_start_stop_id["stop_id"].iloc[0]
+      SHORTENINGS_DB[short_trip_start_voyage_id] = trip_shortening
+      if voyage_id == short_trip_start_voyage_id: # Update trip_info if shortening applies to self
+        trip_info["trip_shortened_start"] = short_trip_start_stop_id["stop_id"].iloc[0]
+        trip_info["trip_shortened"] = True
+    elif short_trip_start_stop:
+      trip_info["trip_shortened"] = True
+      logging.error(f"Short trip start stop {short_trip_start_stop} for service {service_id} not found in GTFS feed.")
+  
+  # 3. Validate if shortening was not applied in a previous trip (through database check)
+  trip_info["trip_shortened"] = True if SHORTENINGS_DB.get(voyage_id, {}) else False
+  trip_info["trip_shortened_start"] = SHORTENINGS_DB.get(voyage_id, {}).get("starts", None)
+  trip_info["trip_shortened_end"] = SHORTENINGS_DB.get(voyage_id, {}).get("ends", None)
+  
+  # 4. Relate with GTFS
+  if trip_info["start_stop"] and trip_info["end_stop"]:
+    # > Get trips for route and direction (if provided) for date
+    trips_date = trips_with_day[
+      (trips_with_day["date"] == date)
+      & (trips_with_day["route_short_name"] == trip_info["RouteNumber"])
+    ]
+    if direction_id is not None:
+      trips_date = trips_date[trips_date["direction_id"] == direction_id]
+    # > Match Carris event log stop name with GTFS stop_name for that service_ids
+    start_candidates = feed_stops_services[
+      feed_stops_services["service_id"].isin(service_ids) 
+      & (feed_stops_services["stop_name"] == trip_info["start_stop"])
+    ]
+    end_candidates = feed_stops_services[
+      feed_stops_services["service_id"].isin(service_ids) 
+      & (feed_stops_services["stop_name"] == trip_info["end_stop"])
+    ]
+    # > Find trips that have matching start/end stops
+    trips_candidates = trips_date[
+      (trips_date["departure_stop"].isin(start_candidates["stop_id"]))
+      & (trips_date["arrival_stop"].isin(end_candidates["stop_id"]))
+    ]
+    # > If any trip candidate, find the one with closest departure time to events first timestamp
+    if not trips_candidates.empty:
+      # Find candidate with trips_candidates["departure_time"] (datetime.time) closest to trip_info["start_timestap"] (this one, at miliseconds)
+      start_dt = datetime.fromtimestamp(trip_info["start_timestamp"] / 1000).time()
+      start_delta = pd.to_timedelta(
+        start_dt.hour*3600 + start_dt.minute*60 + start_dt.second,
+        unit="s"
+      )
+      departure_delta = pd.to_timedelta(trips_with_day["departure_time"])
+      trips_candidates.loc[:, "departure_time_diff"] = (departure_delta - start_delta).abs()
+      # Get candidate with least departure_time_diff
+      trips_candidate = trips_candidates.sort_values("departure_time_diff").reset_index(drop=True).iloc[0]
+
+      trip_info["trip_id"] = trips_candidate["trip_id"]
+      trip_info["trip_id_start_diff"] = int(trips_candidate["departure_time_diff"].total_seconds() / 60)  # Seconds
+      trip_info["trip_id_duration_diff"] = trip_info["duration"] - trips_candidate["duration"]
+      trip_info["end_stop_id"] = trips_candidates["arrival_stop"].iloc[0]
+      trip_info["start_stop_id"] = trips_candidates["departure_stop"].iloc[0]
+    else: # When shortened, no matches :/
+      if trip_info["trip_shortened_end"]:
+        trip_info["end_stop_id"] = trip_info["trip_shortened_end"]
+        trips_candidates = trips_date[trips_date["departure_stop"].isin(start_candidates["stop_id"])]
+        if not trips_candidates.empty:
+          trip_info["start_stop_id"] = trips_candidates["departure_stop"].iloc[0]
+      if trip_info["trip_shortened_start"]:
+        trip_info["start_stop_id"] = trip_info["trip_shortened_start"]
+        trips_candidates = trips_date[trips_date["arrival_stop"].isin(end_candidates["stop_id"])]
+        if not trips_candidates.empty:
+          trip_info["end_stop_id"] = trips_candidates["arrival_stop"].iloc[0]
+  
+  return trip_info
+```
+
+
+### Main script
+
+```{.python}
+import pandas as pd
+import partridge as ptg  # for GTFS # pip install partridge
+from datetime import datetime
+import time
+import logging
+
+from scripts.process_service import process_service  # Import the function to process service events
+
+"""
+This script analyses the events for each trip provided, generating an aggregated information per trip, with attributs like:
+  - GTFS trip_id (if match is possible)
+  - Start and end information, timestamps
+  - Shortening information
+  - Relevant events genareted during the trip
+"""
+
+# Parameters
+timespan = "20250501_20250531"
+print("timespan", timespan)
+
+# --- Logging set up ---
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(f"logs/process_events_{timespan}.log"),
+        logging.StreamHandler()
+    ]
+)
+
+# --- Load GTFS ---
+logging.info("Loading GTFS data...")
+feed = ptg.load_feed("db/gtfs_01_05.zip")
+feed_service_ids = ptg.read_service_ids_by_date("db/gtfs_01_05.zip")
+feed_stops_services = feed.stops.merge(feed.stop_times, on="stop_id", how="left").merge(feed.trips, on="trip_id", how="left").merge(feed.calendar, on="service_id", how="left") 
+feed_stops_services = feed_stops_services[["stop_id", "stop_name", "stop_code", "service_id"]].drop_duplicates() # Select stop_id, stop_name, service_id (distinct)
+logging.info(f"GTFS data loaded. Number of services: {len(feed_service_ids)}. Number of stops with services: {len(feed_stops_services)}.")
+
+# --- Load trips_with_day ---
+logging.info("Loading trips with day data...")
+trips_with_day = pd.read_csv("calculations/trips_with_day.csv")
+trips_with_day["date"] = pd.to_datetime(trips_with_day["date"]).dt.date
+# len(trips_with_day) # 1045058
+logging.info(f"Trips with day data loaded. Number of records: {len(trips_with_day)}.")
+
+# --- Load events ---
+logging.info("Loading events data...")
+events = pd.read_csv(f"csv/events_{timespan}_bus_categorised.csv", low_memory=False)
+logging.info(f"Events data loaded. Number of records: {len(events)}.")
+
+# main()
+start_time = time.time() # Monitor execution time
+
+output_file = f"csv/events_{timespan}_trips_processed.csv"
+
+events_group = events.sort_values("timestamp").groupby("service_id", sort=False)
+# .query("service_id in ['20250120736126Z736', '202501207031104Z703', '20250120723134Z723', '20250120208114Z208']")
+
+logging.info(f"Processing {len(events_group)} service groups...")
+first_write = True  # to control header writing
+with open(output_file, "w", newline="", encoding="utf-8") as f:
+  for service_id, df in events_group:
+    # print("service", service_id, len(df), first_write)
+    # process this group
+    processed_df = process_service(df, feed_service_ids, feed_stops_services, trips_with_day)
+    
+    # append to CSV incrementally
+    processed_df.to_frame().T.to_csv(f, header=first_write, mode='a')
+    first_write = False  # after the first group, never write headers again
+    
+end_time = time.time()
+logging.info(f"Execution time: {end_time - start_time:.2f} seconds")
+```
+

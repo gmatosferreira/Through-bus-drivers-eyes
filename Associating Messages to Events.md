@@ -1,0 +1,93 @@
+# Associating Messages to Events
+
+
+``` python
+import pandas as pd
+import logging
+import os
+from datetime import datetime
+
+# --- Logging set up ---
+timespan = datetime.now().strftime("%Y%m%d_%H%M%S")
+os.makedirs("logs", exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(f"logs/trips_relate_messages_{timespan}.log"),
+        logging.StreamHandler()
+    ]
+)
+
+# Input/output files
+trips_file = "csv/trips_cleaned.csv"
+messages_file = "csv/messages_2025_withFreeTextCategories.csv"
+output_file = "csv/trips_cleaned_with_message_counts.csv"
+
+logging.info("Loading trips from %s", trips_file)
+trips = pd.read_csv(trips_file)
+
+logging.info("Loading messages from %s", messages_file)
+messages = pd.read_csv(messages_file)
+
+# Keep only trips with trip_id defined
+before_filter = len(trips)
+trips = trips[trips["trip_id"].notna()]
+logging.info("Filtered trips: %d -> %d (kept only with trip_id)", before_filter, len(trips))
+
+# Relevant message IDs and their output column names
+message_map = {
+    429: "proceed_request",
+    440: "reserved",
+    443: "next_missing",
+    444: "control_driving",
+    445: "schedule_warning",
+    447: "lost_and_found",
+    466: "full",
+    467: "accident",
+    477: "traffic",
+    478: "bunching",
+    480: "wheelchair",
+    902: "flags",
+    904: "shortening",
+    905: "transfer",
+    906: "overcome",
+}
+
+# Ensure timestamps are numeric
+trips["start_timestamp"] = pd.to_numeric(trips["start_timestamp"], errors="coerce")
+trips["end_timestamp"] = pd.to_numeric(trips["end_timestamp"], errors="coerce")
+messages["timestamp"] = pd.to_numeric(messages["timestamp"], errors="coerce")
+
+# Initialize new columns
+for col in message_map.values():
+    trips[col] = 0
+
+logging.info("Processing %d trips...", len(trips))
+
+for idx, trip in trips.iterrows():
+    route = trip["RouteNumber"]
+    driver = trip["DriverMec"]
+    start = trip["start_timestamp"]
+    end = trip["end_timestamp"]
+
+    trip_msgs = messages[
+        (messages["RouteNumber"] == route) &
+        (messages["DriverMec"] == driver) &
+        (messages["timestamp"] > start) &
+        (messages["timestamp"] < end)
+    ]
+
+    if not trip_msgs.empty:
+        counts = trip_msgs["message_id"].value_counts()
+        for msg_id, col_name in message_map.items():
+            trips.at[idx, col_name] = int(counts.get(msg_id, 0))
+
+    if idx % 100 == 0:
+        logging.info("Processed %d trips...", idx)
+
+logging.info("Saving results to %s", output_file)
+trips.to_csv(output_file, index=False)
+logging.info("✅ Done. Trips with message counts saved.")
+```

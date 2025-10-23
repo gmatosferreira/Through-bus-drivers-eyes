@@ -1,0 +1,123 @@
+---
+title: "Events: Bus Bunching"
+format: gfm
+---
+
+```{r}
+#| echo: true
+#| eval: false
+library(dplyr)
+library(tidyverse)
+```
+
+Load events
+```{r}
+#| echo: true
+#| eval: false
+events_11 = read.csv("csv/events_20250501_20250531_bus_categorised_category_11.csv") # Using stop detection events (ID 11)
+```
+
+Clean data
+```{r}
+#| echo: true
+#| eval: false
+routes_stops = trips_with_day |> 
+  dplyr::select(route_short_name, departure_stop_id, arrival_stop_id) |> 
+  distinct() |> 
+  pivot_longer(
+    cols = c(departure_stop_id, arrival_stop_id),
+    names_to = "stop_type",
+    values_to = "stop_ref"
+  )
+
+stops_names = events_11 |> 
+  select(BusStopNumber, stop_ref) |> 
+  distinct()
+
+# Remove edge stations for each route
+events_11 = events_11 |> 
+  left_join(
+    routes_stops |> select(route_short_name, stop_ref) |> mutate(terminal_stop = TRUE), 
+    by = c(
+      "RouteNumber" = "route_short_name",
+      "BusStopNumber" = "stop_ref"
+      ),
+    multiple = "first"
+    ) |>
+  filter(is.na(terminal_stop))
+
+# Remove stops that are not on the route
+gtfs_routes_stops = gtfs_04_05$routes |>
+  select(route_id, route_short_name) |>
+  left_join(
+    gtfs_04_05$trips |> select(route_id, trip_id) |> distinct(),
+    by = "route_id"
+  ) |> left_join(
+    gtfs_04_05$stop_times |> select(trip_id, stop_id, stop_sequence),
+    by = "trip_id"
+  ) |> 
+  select(route_short_name, stop_id) |> distinct() |>
+  mutate(stop_id = as.integer(stop_id)) |> 
+  left_join(stops_names |> mutate(BusStopNumber = as.integer(BusStopNumber)), by = c("stop_id" = "BusStopNumber"))
+
+events_11 = events_11 |> 
+  left_join(
+    gtfs_routes_stops |> select(route_short_name, stop_id) |> mutate(part_of_route = TRUE), 
+    by = c(
+      "RouteNumber" = "route_short_name",
+      "BusStopNumber" = "stop_id"
+      ),
+    multiple = "first"
+    ) |> filter(part_of_route == TRUE)
+```
+
+
+Evaluate bus bunching
+
+```{r}
+#| echo: true
+#| eval: false
+# % of stop times in which more than one bus arrived in the -1 and +5 minutes window
+bunching = events_11 |> 
+  group_by(BusStopNumber, RouteNumber, direction) |> 
+  arrange(timestamp, .by_group = TRUE) |>
+  mutate(
+    timestamp = as.POSIXct(timestamp / 1000, origin = "1970-01-01", tz = "UTC"), 
+    date = as.Date(timestamp),
+    hh = as.integer(format(timestamp, "%H"))
+  ) |>
+  mutate(
+    # difference from the *previous* detection (mins)
+    diff_prev = as.numeric(difftime(timestamp, lag(timestamp), units = "mins")),
+    # difference to the *next* detection (mins)
+    diff_next = as.numeric(difftime(lead(timestamp), timestamp, units = "mins")),
+    
+    # bunching if previous is within -1 min, or next within +5 mins
+    bunched = (diff_prev >= -1 & diff_prev <= 0) |
+              (diff_next >= 0 & diff_next <= 5)
+  ) %>%
+  ungroup()
+
+bunching_summary = bunching |> 
+  summarise(
+    n_stops = n(),
+    n_bunched = sum(bunched, na.rm = TRUE),
+    pct_bunched = n_bunched / n_stops * 100
+  ) |> 
+  ungroup() |> 
+  arrange(desc(pct_bunched)) |>
+  as.vector()
+
+bunching_summary_per_route_AND_stop = bunching |>
+  group_by(BusStopNumber, RouteNumber) |> 
+  summarise(
+    n_stops = n(),
+    n_bunched = sum(bunched, na.rm = TRUE),
+    pct_bunched = n_bunched / n_stops * 100
+  ) |> 
+  ungroup() |> 
+  arrange(desc(pct_bunched)) |> 
+  left_join(stops_names, by = "BusStopNumber")
+```
+
+

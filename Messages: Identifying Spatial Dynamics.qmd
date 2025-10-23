@@ -1,0 +1,130 @@
+---
+title: "Messages: Identifying Spatial Dynamics"
+format: gfm
+---
+
+```{r}
+#| echo: true
+#| eval: false
+library(sf)
+library(ggplot2)
+```
+
+Load data
+```{r}
+#| echo: true
+#| eval: false
+data = read.csv("csv/messages_2025.csv") |> mutate(
+  datetime = as.POSIXct(timestamp / 1000, origin = "1970-01-01", tz = "UTC"), date=as.Date(datetime),
+  date = as.Date(timestamp, format="%Y-%m-%d", tz="UTC"),
+  hour = as.integer(format(timestamp, "%H")),
+  month = format(datetime, "%B"),
+  day_of_week = weekdays(datetime),
+  is_weekend = day_of_week %in% c("Saturday", "Sunday")
+) |> 
+  filter(date>="2025-01-20") |> 
+  filter(!grepl("E", RouteNumber)) |>
+  sf::st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove=FALSE)
+
+```
+
+Remove messages outside Lisboa (outliers)
+```{r}
+#| echo: true
+#| eval: false
+aml = sf::st_read("https://github.com/U-Shift/MQAT/raw/refs/heads/main/geo/MUNICIPIOSgeo.gpkg", quiet = TRUE)
+lisboa = aml |> dplyr::filter(Concelho == "Lisboa") |> sf::st_bbox()
+lisboa_bbox = sf::st_bbox(lisboa)
+
+data = data |> 
+  filter(
+    longitude >= lisboa_bbox["xmin"] & longitude <= lisboa_bbox["xmax"] &
+    latitude >= lisboa_bbox["ymin"] & latitude <= lisboa_bbox["ymax"]
+  )
+
+bbox = sf::st_bbox(data)
+```
+
+Prepare base maps 
+```{r}
+#| echo: true
+#| eval: false
+# Based on https://u-shift.github.io/Traffic-Simulation-Models/pois.html#hexagonal-using-h3jsr
+library(h3jsr)
+# Resolution: https://h3geo.org/docs/core-library/restable/ 
+h3_res = 9 # 400m diameter
+
+city_limit = st_read("https://github.com/U-Shift/Traffic-Simulation-Models/raw/refs/heads/main/data/Lisbon/Lisboa_lim.gpkg")
+road_network_base = st_read("https://github.com/U-Shift/Traffic-Simulation-Models/releases/download/2025/REDEbase_Lx.gpkg")
+
+road_network_base = road_network_base |> # Only consider those inside city_limit
+  st_intersection(city_limit) |>
+  st_transform(crs = 4326)
+
+plot(road_network_base |> filter(highway %in% c("primary", "primary_link")))
+
+GRID_h3 = city_limit |>  
+  polygon_to_cells(res = h3_res, simple = FALSE)
+GRID_h3 = GRID_h3$h3_addresses |>
+  cell_to_polygon(simple = FALSE)
+GRID_h3 = GRID_h3 |>
+  mutate(id = seq(1:nrow(GRID_h3))) 
+h3_index = GRID_h3 |> st_drop_geometry() 
+
+gplot_city = geom_sf(
+    data = city_limit, 
+    color = "gray30", fill = NA,linewidth = .5
+  ) 
+  
+gplot_roads = geom_sf(
+    data = road_network_base |> 
+      dplyr::filter(highway %in% c("trunk", "primary", "motorway")),
+    color = "gray45", alpha = 0.4, linewidth = 0.5
+  ) 
+```
+
+Draw maps
+```{r}
+#| echo: true
+#| eval: false
+message_full = data_withFreeTextCategories_sf |> filter(message_id == 460) 
+
+messages_per_grid = message_full |> 
+  mutate(
+    h3_address = point_to_cell(st_as_sf(message_full, coords = c("stop_lon", "stop_lat"), crs = 4326), res = h3_res)
+  ) |>
+  sf::st_drop_geometry() |>
+  group_by(h3_address) |>
+  summarise(
+    n_messages = n()
+  )
+
+grid_messages = GRID_h3 |> 
+  left_join(messages_per_grid, by = "h3_address") |> 
+  arrange(desc(n_messages))
+
+ggplot() +
+  # Grid bunching (colored polygons)
+  geom_sf(
+    data = grid_messages |> filter(!is.na(n_messages)),
+    aes(fill = n_messages),
+    color = NA
+  ) +
+  gplot_city + 
+  gplot_roads +
+  # Color scale similar to mapview::turbo(10)
+  scale_fill_viridis_c(option = "rocket", direction=-1, limits=c(0, 200)) +
+  # Theme adjustments
+  theme_minimal() +
+  theme(
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 8),
+    legend.position = "bottom",
+    panel.grid.major = element_line(color = "transparent"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank()
+  ) +
+  labs(fill = "Messages (#)")
+```
+
